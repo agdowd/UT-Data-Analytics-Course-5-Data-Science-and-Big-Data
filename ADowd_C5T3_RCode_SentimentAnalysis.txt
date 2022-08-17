@@ -1,0 +1,1157 @@
+library(caret)
+library(plotly)
+library(corrplot)
+library(plyr)
+
+
+################################################################################
+################################################################################
+###                                                                          ###
+###                        Set Up Parallel Processing                        ###
+###                                                                          ###
+################################################################################
+################################################################################
+
+
+library(doParallel)
+
+# Create Cluster with desired number of cores.
+cl <- makeCluster(12)
+
+# Register Cluster
+registerDoParallel(cl)
+
+# Confirm how many cores are now "assigned" to R and RStudio
+getDoParWorkers() # Result 12 
+
+# Stop Cluster. After performing your tasks, stop your cluster. 
+# stopCluster(cl)
+
+
+################################################################################
+################################################################################
+###                                                                          ###
+###                             Explore the Data                             ###
+###                                                                          ###
+################################################################################
+################################################################################
+
+
+iSent <- read.csv("iphone_smallmatrix_labeled_8d.csv")
+gSent <- read.csv("galaxy_smallmatrix_labeled_9d.csv")
+
+str(iSent)
+summary(iSent)
+
+str(gSent)
+summary(gSent)
+
+# Convert y variables to factor for classification -- MOVE THIS STEP AFTER CHECKING CORRELATION
+# iSent$iphonesentiment <- as.factor(iSent$iphonesentiment)
+# gSent$galaxysentiment <- as.factor(gSent$galaxysentiment)
+
+# Plot instances of each class of y variable
+plot_ly(iSent, x= ~iSent$iphonesentiment, type='histogram')
+plot_ly(gSent, x= ~gSent$galaxysentiment, type='histogram')
+
+# Check for missing values
+sum(is.na(iSent))    # No missing values
+sum(is.na(gSent))    # No missing values
+
+
+################################################################################
+################################################################################
+###                                                                          ###
+###                   Preprocessing and Feature Selection                    ###
+###                                                                          ###
+################################################################################
+################################################################################
+
+
+                          ###########################
+                          ##      Correlation      ##
+                          ###########################
+
+iCorY <- cor(iSent[,1:58], iSent[,59])
+gCorY <- cor(gSent[,1:58], gSent[,59])
+
+corrplot(iCorY)
+corrplot(gCorY)
+
+iCor <- cor(iSent, iSent)
+gCor <- cor(gSent, gSent)
+
+corrplot(iCor)
+corrplot(gCor)
+
+# No strong correlations of Y variables to any individual features
+
+# Convert y variables to factor for classification
+iSent$iphonesentiment <- as.factor(iSent$iphonesentiment)
+gSent$galaxysentiment <- as.factor(gSent$galaxysentiment)
+
+                          ###########################
+                          ##   Feature Variance    ##
+                          ###########################
+
+#### Start with iPhone ####
+
+# Check for near zero variance of features in iPhone Sentiment data frame
+nzviPhone <- nearZeroVar(iSent, saveMetrics=TRUE)
+nzviPhone    # Looks like if freqRatio < 17, nzv = FALSE
+
+# Return vector of nzv features
+nzviPhone <- nearZeroVar(iSent, saveMetrics=FALSE)
+nzviPhone
+
+# Create new dataframe without nzv features
+iSentNZV <- iSent[,-nzviPhone]
+str(iSentNZV)
+
+#### Repeat for Galaxy Sentiment data frame ####
+
+# Check for near zero variance of features
+nzvGalaxy <- nearZeroVar(gSent, saveMetrics=TRUE)
+nzvGalaxy    # If freqRatio < 17, nzv = FALSE
+
+# Return vector of nzv features
+nzvGalaxy <- nearZeroVar(gSent, saveMetrics=FALSE)
+nzvGalaxy
+
+# Create new dataframe without nzv features
+gSentNZV <- gSent[,-nzvGalaxy]
+str(gSentNZV)
+
+# NZV removal results in same features being used for both data frames
+
+                   #######################################
+                   ##   Recursive Feature Elimination   ##
+                   #######################################
+
+#### Start with iPhone ####
+
+# Sample the data to improve processing time
+set.seed(2395)
+iphoneSample <- iSent[sample(1:nrow(iSent), 1000, replace=FALSE),]
+
+# Set up rfeControl with randomforest, repeated cross validation, and no updates
+ctrl <- rfeControl(functions=rfFuncs, method="repeatedcv", repeats=2, verbose=FALSE)
+
+# Use rfe and omit the response variable (attribute 59)
+system.time(
+irfeResults <- rfe(iphoneSample[,1:58], iphoneSample$iphonesentiment,
+                   sizes=(1:58), rfeControl=ctrl)
+)    # Elapsed 94.38
+
+irfeResults
+plot(irfeResults, type=c("g", "o"))
+
+# Create new dataset with rfe recommended features
+iSentRFE <- iSent[,predictors(irfeResults)]
+
+# Add the dependent variable to iSentRFE
+iSentRFE$iphonesentiment <- iSent$iphonesentiment
+
+# Review outcome
+str(iSentRFE)
+
+#### Repeat RFE for Galaxy ####
+
+# Sample the data to improve processing time
+set.seed(2395)
+galaxySample <- gSent[sample(1:nrow(gSent), 1000, replace=FALSE),]
+
+# Use rfe and omit the response variable (attribute 59)
+system.time(
+  grfeResults <- rfe(galaxySample[,1:58], galaxySample$galaxysentiment,
+                     sizes=(1:58), rfeControl=ctrl)
+)    # Elapsed 94.34
+
+grfeResults
+plot(grfeResults, type=c("g", "o"))
+
+# Create new dataset with rfe recommended features
+gSentRFE <- gSent[,predictors(grfeResults)]
+
+# Add the dependent variable to iSentRFE
+gSentRFE$galaxysentiment <- gSent$galaxysentiment
+
+# Review outcome
+str(gSentRFE)
+
+
+################################################################################
+################################################################################
+###                                                                          ###
+###                     Model Development and Evaluation                     ###
+###                                                                          ###
+################################################################################
+################################################################################
+
+
+library(C50)                    # For C5.0 model
+library(plyr)                   # For C5.0 model
+library(randomForest)           # For Random Forest model
+library(e1071)                  # For SVM model
+library(kknn)                   # For KKNN model
+
+                          ###########################
+                          ##   Train/Test Split    ##
+                          ###########################
+
+# Splitting iSent into training and testing sets
+set.seed(2395)
+index_iSent <- createDataPartition(iSent$iphonesentiment, p=0.7, list=FALSE)
+trainSetiALL <- iSent[index_iSent,]
+testSetiALL <- iSent[-index_iSent,]
+
+# Splitting gSent into training and testing sets
+set.seed(2395)
+index_gSent <- createDataPartition(gSent$galaxysentiment, p=0.7, list=FALSE)
+trainSetgALL <- gSent[index_gSent,]
+testSetgALL <- gSent[-index_gSent,]
+
+                          ###########################
+                          ##      Train Models     ##
+                          ###########################
+
+# Tuning parameters
+tCtrl <- trainControl(method="repeatedcv", number=10, repeats=2)
+
+#### Start with iPhone ####
+
+# Train C5.0 model
+set.seed(2395)
+system.time(
+  c50iFit <- train(trainSetiALL[,1:58], trainSetiALL$iphonesentiment, method="C5.0", trControl=tCtrl, tuneLength=10)
+)    # Elapsed 16.47
+
+# Train randomforest model
+set.seed(2395)
+system.time(
+  rfiFit <- train(trainSetiALL[,1:58], trainSetiALL$iphonesentiment, method="rf", trControl=tCtrl, tuneLength=10)
+)    # Elapsed 510.89
+
+# Train SVM model
+set.seed(2395)
+system.time(
+  svmiFit <- train(trainSetiALL[,1:58], trainSetiALL$iphonesentiment, method="svmLinear2", trControl=tCtrl, tuneLength=10)
+)    # Elapsed 5008.98
+
+# Train KKNN model
+set.seed(2395)
+system.time(
+  kknniFit <- train(trainSetiALL[,1:58], trainSetiALL$iphonesentiment, method="kknn", trControl=tCtrl, tuneLength=10)
+)    # Elapsed 160.36
+
+# Review results
+c50iFit
+rfiFit
+svmiFit
+kknniFit
+
+#### Repeat with Galaxy ####
+
+# Train C5.0 model
+set.seed(2395)
+system.time(
+  c50gFit <- train(trainSetgALL[,1:58], trainSetgALL$galaxysentiment, method="C5.0", trControl=tCtrl, tuneLength=10)
+)    # Elapsed 13.56
+
+# Train randomforest model
+set.seed(2395)
+system.time(
+  rfgFit <- train(trainSetgALL[,1:58], trainSetgALL$galaxysentiment, method="rf", trControl=tCtrl, tuneLength=10)
+)    # Elapsed 476.79
+
+# Train SVM model
+set.seed(2395)
+system.time(
+  svmgFit <- train(trainSetgALL[,1:58], trainSetgALL$galaxysentiment, method="svmLinear2", trControl=tCtrl, tuneLength=10)
+)    # Elapsed 5353.99
+
+# Train KKNN model
+set.seed(2395)
+system.time(
+  kknngFit <- train(trainSetgALL[,1:58], trainSetgALL$galaxysentiment, method="kknn", trControl=tCtrl, tuneLength=10)
+)    # Elapsed 161.86
+
+# Review results
+c50gFit
+rfgFit
+svmgFit
+kknngFit
+
+                          ###########################
+                          ##      Test Models      ##
+                          ###########################
+
+#### iPhone ####
+
+# Make predictions on test set
+c50iALLPreds <- predict(c50iFit, newdata=testSetiALL)
+rfiALLPreds <- predict(rfiFit, newdata=testSetiALL)
+svmiALLPreds <- predict(svmiFit, newdata=testSetiALL)
+kknniALLPreds <- predict(kknniFit, newdata=testSetiALL)
+
+# Run postResample to check accuracy/Kappa
+c50priALL <- postResample(c50iALLPreds, testSetiALL$iphonesentiment)
+rfpriALL <- postResample(rfiALLPreds, testSetiALL$iphonesentiment)
+svmpriALL <- postResample(svmiALLPreds, testSetiALL$iphonesentiment)
+kknnpriALL <- postResample(kknniALLPreds, testSetiALL$iphonesentiment)
+
+postResampleGridiALL <- as.data.frame(c(C50=c50priALL, RF=rfpriALL, SVM=svmpriALL, KNN=kknnpriALL))
+postResampleGridiALL
+
+# C5.0 and RF are nearly identical in ACC and KAPPA. Create confusion matrices for C5.0 and RF and compare.
+cmC50iALL <- confusionMatrix(c50iALLPreds, testSetiALL$iphonesentiment)
+cmRFiALL <- confusionMatrix(rfiALLPreds, testSetiALL$iphonesentiment)
+
+cmC50iALL
+cmRFiALL
+# RF has a slight edge
+
+#### Galaxy ####
+
+# Make predictions on test set
+c50gALLPreds <- predict(c50gFit, newdata=testSetgALL)
+rfgALLPreds <- predict(rfgFit, newdata=testSetgALL)
+svmgALLPreds <- predict(svmgFit, newdata=testSetgALL)
+kknngALLPreds <- predict(kknngFit, newdata=testSetgALL)
+
+# Run postResample to check accuracy/Kappa
+c50prgALL <- postResample(c50gALLPreds, testSetgALL$galaxysentiment)
+rfprgALL <- postResample(rfgALLPreds, testSetgALL$galaxysentiment)
+svmprgALL <- postResample(svmgALLPreds, testSetgALL$galaxysentiment)
+kknnprgALL <- postResample(kknngALLPreds, testSetgALL$galaxysentiment)
+
+postResampleGridgALL <- as.data.frame(c(C50=c50prgALL, RF=rfprgALL, SVM=svmprgALL, KNN=kknnprgALL))
+postResampleGridgALL
+
+# Create confusion matrices for C5.0 and RF and compare
+cmC50gALL <- confusionMatrix(c50gALLPreds, testSetgALL$galaxysentiment)
+cmRFgALL <- confusionMatrix(rfgALLPreds, testSetgALL$galaxysentiment)
+
+cmC50gALL
+cmRFgALL
+
+# RF seems to maintain a slight edge over C5.0 in most metrics, but not by much. 
+# I'll build both C5.0 and RF models with the feature selected data sets to see
+# if the metrics can be improved upon.
+
+
+################################################################################
+
+
+                      ##################################
+                      ##   Train/Test Split: NZV Set  ##
+                      ##################################
+
+# Splitting iSentNZV into training and testing sets
+set.seed(2395)
+index_iSentNZV <- createDataPartition(iSentNZV$iphonesentiment, p=0.7, list=FALSE)
+trainSetiNZV <- iSentNZV[index_iSentNZV,]
+testSetiNZV <- iSentNZV[-index_iSentNZV,]
+
+# Splitting gSentNZV into training and testing sets
+set.seed(2395)
+index_gSentNZV <- createDataPartition(gSentNZV$galaxysentiment, p=0.7, list=FALSE)
+trainSetgNZV <- gSentNZV[index_gSentNZV,]
+testSetgNZV <- gSentNZV[-index_gSentNZV,]
+
+                      ##################################
+                      ##     Train Models: NZV Set    ##
+                      ##################################
+
+#### iPhone ####
+
+# Train C5.0 model
+set.seed(2395)
+system.time(
+  c50iNZVFit <- train(trainSetiNZV[,1:11], trainSetiNZV$iphonesentiment, method="C5.0", trControl=tCtrl, tuneLength=10)
+)    # Elapsed 4.09
+
+# Train randomforest model
+set.seed(2395)
+system.time(
+  rfiNZVFit <- train(trainSetiNZV[,1:11], trainSetiNZV$iphonesentiment, method="rf", trControl=tCtrl, tuneLength=10)
+)    # Elapsed 83.27
+
+# Review results
+c50iNZVFit
+rfiNZVFit
+
+#### Galaxy ####
+
+# Train C5.0 model
+set.seed(2395)
+system.time(
+  c50gNZVFit <- train(trainSetgNZV[,1:11], trainSetgNZV$galaxysentiment, method="C5.0", trControl=tCtrl, tuneLength=10)
+)    # Elapsed 3.92
+
+# Train randomforest model
+set.seed(2395)
+system.time(
+  rfgNZVFit <- train(trainSetgNZV[,1:11], trainSetgNZV$galaxysentiment, method="rf", trControl=tCtrl, tuneLength=10)
+)    # Elapsed 79.36
+
+# Review results
+c50gNZVFit
+rfgNZVFit
+
+                      ##################################
+                      ##     Test Models: NVZ Set     ##
+                      ##################################
+
+#### iPhone ####
+
+# Make predictions on test set
+c50iNZVPreds <- predict(c50iNZVFit, newdata=testSetiNZV)
+rfiNZVPreds <- predict(rfiNZVFit, newdata=testSetiNZV)
+
+# Run postResample to check accuracy/Kappa
+c50priNZV <- postResample(c50iNZVPreds, testSetiNZV$iphonesentiment)
+rfpriNZV <- postResample(rfiNZVPreds, testSetiNZV$iphonesentiment)
+
+postResampleGridiNZV <- as.data.frame(c(C50=c50priNZV, RF=rfpriNZV))
+postResampleGridiNZV
+
+#### Galaxy ####
+
+# Make predictions on test set
+c50gNZVPreds <- predict(c50gNZVFit, newdata=testSetgNZV)
+rfgNZVPreds <- predict(rfgNZVFit, newdata=testSetgNZV)
+
+# Run postResample to check accuracy/Kappa
+c50prgNZV <- postResample(c50gNZVPreds, testSetgNZV$galaxysentiment)
+rfprgNZV <- postResample(rfgNZVPreds, testSetgNZV$galaxysentiment)
+
+postResampleGridgNZV <- as.data.frame(c(C50=c50prgNZV, RF=rfprgNZV))
+postResampleGridgNZV
+
+
+################################################################################
+
+
+                      ##################################
+                      ##   Train/Test Split: RFE Set  ##
+                      ##################################
+
+# Splitting iSentRFE into training and testing sets
+set.seed(2395)
+index_iSentRFE <- createDataPartition(iSentRFE$iphonesentiment, p=0.7, list=FALSE)
+trainSetiRFE <- iSentRFE[index_iSentRFE,]
+testSetiRFE <- iSentRFE[-index_iSentRFE,]
+
+# Splitting gSentRFE into training and testing sets
+set.seed(2395)
+index_gSentRFE <- createDataPartition(gSentRFE$galaxysentiment, p=0.7, list=FALSE)
+trainSetgRFE <- gSentRFE[index_gSentRFE,]
+testSetgRFE <- gSentRFE[-index_gSentRFE,]
+
+                      ##################################
+                      ##     Train Models: RFE Set    ##
+                      ##################################
+
+#### iPhone ####
+
+# Train C5.0 model
+set.seed(2395)
+system.time(
+  c50iRFEFit <- train(trainSetiRFE[,1:25], trainSetiRFE$iphonesentiment, method="C5.0", trControl=tCtrl, tuneLength=10)
+)    # Elapsed 8.26
+
+# Train randomforest model
+set.seed(2395)
+system.time(
+  rfiRFEFit <- train(trainSetiRFE[,1:25], trainSetiRFE$iphonesentiment, method="rf", trControl=tCtrl, tuneLength=10)
+)    # Elapsed 175.59
+
+# Review results
+c50iRFEFit
+rfiRFEFit
+
+#### Galaxy ####
+
+# Train C5.0 model
+set.seed(2395)
+system.time(
+  c50gRFEFit <- train(trainSetgRFE[,1:18], trainSetgRFE$galaxysentiment, method="C5.0", trControl=tCtrl, tuneLength=10)
+)    # Elapsed 7.39 
+
+# Train randomforest model
+set.seed(2395)
+system.time(
+  rfgRFEFit <- train(trainSetgRFE[,1:18], trainSetgRFE$galaxysentiment, method="rf", trControl=tCtrl, tuneLength=10)
+)    # Elapsed 133.50
+
+# Review results
+c50gRFEFit
+rfgRFEFit
+
+                      ##################################
+                      ##     Test Models: RFE Set     ##
+                      ##################################
+
+#### iPhone ####
+
+# Make predictions on test set
+c50iRFEPreds <- predict(c50iRFEFit, newdata=testSetiRFE)
+rfiRFEPreds <- predict(rfiRFEFit, newdata=testSetiRFE)
+
+# Run postResample to check accuracy/Kappa
+c50priRFE <- postResample(c50iRFEPreds, testSetiRFE$iphonesentiment)
+rfpriRFE <- postResample(rfiRFEPreds, testSetiRFE$iphonesentiment)
+
+postResampleGridiRFE <- as.data.frame(c(C50=c50priRFE, RF=rfpriRFE))
+postResampleGridiRFE
+
+#### Galaxy ####
+
+# Make predictions on test set
+c50gRFEPreds <- predict(c50gRFEFit, newdata=testSetgRFE)
+rfgRFEPreds <- predict(rfgRFEFit, newdata=testSetgRFE)
+
+# Run postResample to check accuracy/Kappa
+c50prgRFE <- postResample(c50gRFEPreds, testSetgRFE$galaxysentiment)
+rfprgRFE <- postResample(rfgRFEPreds, testSetgRFE$galaxysentiment)
+
+postResampleGridgRFE <- as.data.frame(c(C50=c50prgRFE, RF=rfprgRFE))
+postResampleGridgRFE
+
+
+                      ##################################
+                      ##       Comparing Results      ##
+                      ##################################
+
+# library(InformationValue)       # For analyzing metrics -- resulted in errors in 
+# more important functions. Detached package
+
+# detach("package:InformationValue")
+
+# Using RFE returns almost identical results as using the entire data set, but the
+# run time is significantly improved with fewer features to consider.
+# Generate confusion matrices to see if there is a slight edge for C5.0 or RF.
+
+
+cmC50iRFE <- confusionMatrix(c50iRFEPreds, testSetiRFE$iphonesentiment)
+cmRFiRFE <- confusionMatrix(rfiRFEPreds, testSetiRFE$iphonesentiment)
+cmC50gRFE <- confusionMatrix(c50gRFEPreds, testSetgRFE$galaxysentiment)
+cmRFgRFE <- confusionMatrix(rfgRFEPreds, testSetgRFE$galaxysentiment)
+
+cmC50iRFE
+cmRFiRFE
+cmC50gRFE
+cmRFgRFE
+
+# actuali <- as.numeric(as.character(testSetiRFE$iphonesentiment))
+# actualg <- as.numeric(as.character(testSetgRFE$galaxysentiment))
+# predC50i <- as.numeric(as.character(c50iRFEPreds))
+# predRFi <- as.numeric(as.character(rfiRFEPreds))
+# predC50g <- as.numeric(as.character(c50gRFEPreds))
+# predRFg <- as.numeric(as.character(rfgRFEPreds))
+
+# # Check recall, precision, and F1 of iPhone models
+# recall(actuali, predC50i)
+# precision(actuali, predC50i)
+# fscore(actuali, predC50i)
+
+# recall(actuali, predRFi)
+# precision(actuali, predRFi)
+# fscore(actuali, predRFi)
+
+# # Check recall, precision, and F1 of galaxy models
+# recall(actualg, predC50g)
+# precision(actualg, predC50g)
+# fscore(actualg, predC50g)
+
+# recall(actualg, predRFg)
+# precision(actualg, predRFg)
+# fscore(actualg, predRFg)
+
+
+################################################################################
+################################################################################
+
+
+                      ##################################
+                      ##      Balancing Classes       ##
+                      ##################################
+
+library(UBL)
+
+count(iSent$iphonesentiment)
+count(gSent$galaxysentiment)
+
+# All models so far are grossly overestimating the presence of class 5 due to an
+# imbalance of classes in the original data set. I will try undersampling the data
+# sets to get balanced classes and rerun random forest on the new sets.
+
+# Create balanced data set for iPhone sentiment
+iBalancedRFE <- RandUnderClassif(iphonesentiment~., iSentRFE, C.perc="balance")
+str(iBalancedRFE)
+count(iBalancedRFE$iphonesentiment)
+
+# Create balanced data set for Galaxy sentiment
+gBalancedRFE <- RandUnderClassif(galaxysentiment~., gSentRFE, C.perc="balance")
+count(gBalancedRFE$galaxysentiment)
+
+                      ##################################
+                      ##  Train/Test Split: Balanced  ##
+                      ##################################
+
+# Splitting iBalancedRFE into training and testing sets
+set.seed(2395)
+index_iBalRFE <- createDataPartition(iBalancedRFE$iphonesentiment, p=0.7, list=FALSE)
+trainSetiBalRFE <- iBalancedRFE[index_iBalRFE,]
+testSetiBalRFE <- iBalancedRFE[-index_iBalRFE,]
+
+# Splitting gBalancedRFE into training and testing sets
+set.seed(2395)
+index_gBalRFE <- createDataPartition(gBalancedRFE$galaxysentiment, p=0.7, list=FALSE)
+trainSetgBalRFE <- gBalancedRFE[index_gBalRFE,]
+testSetgBalRFE <- gBalancedRFE[-index_gBalRFE,]
+
+                      ##################################
+                      ##    Train Models: Balanced    ##
+                      ##################################
+
+#### iPhone ####
+
+# Train RF model
+set.seed(2395)
+system.time(
+  rfiBalRFEFit <- train(trainSetiBalRFE[,1:25], trainSetiBalRFE$iphonesentiment, method="rf", trControl=tCtrl, tuneLength=10)
+)    # Elapsed 22.59
+
+#### Galaxy ####
+
+# Train RF model
+set.seed(2395)
+system.time(
+  rfgBalRFEFit <- train(trainSetgBalRFE[,1:18], trainSetgBalRFE$galaxysentiment, method="rf", trControl=tCtrl, tuneLength=10)
+)    # Elapsed 17.90
+
+# Review results
+rfiBalRFEFit
+rfgBalRFEFit
+
+################################################################################
+
+# Undersampling got poor results. Let's try oversampling.
+
+# Create balanced data set for iPhone sentiment
+iBalancedRFE <- RandOverClassif(iphonesentiment~., iSentRFE, C.perc="balance")
+str(iBalancedRFE)
+count(iBalancedRFE$iphonesentiment)
+
+# Create balanced data set for Galaxy sentiment
+gBalancedRFE <- RandOverClassif(galaxysentiment~., gSentRFE, C.perc="balance")
+count(gBalancedRFE$galaxysentiment)
+
+                      ##################################
+                      ##  Train/Test Split: Balanced  ##
+                      ##################################
+
+# Splitting iBalancedRFE into training and testing sets
+set.seed(2395)
+index_iBalRFE <- createDataPartition(iBalancedRFE$iphonesentiment, p=0.7, list=FALSE)
+trainSetiBalRFE <- iBalancedRFE[index_iBalRFE,]
+testSetiBalRFE <- iBalancedRFE[-index_iBalRFE,]
+
+# Splitting gBalancedRFE into training and testing sets
+set.seed(2395)
+index_gBalRFE <- createDataPartition(gBalancedRFE$galaxysentiment, p=0.7, list=FALSE)
+trainSetgBalRFE <- gBalancedRFE[index_gBalRFE,]
+testSetgBalRFE <- gBalancedRFE[-index_gBalRFE,]
+
+                      ##################################
+                      ##    Train Models: Balanced    ##
+                      ##################################
+
+#### iPhone ####
+
+# Train RF model
+set.seed(2395)
+system.time(
+  rfiBalRFEFit <- train(trainSetiBalRFE[,1:25], trainSetiBalRFE$iphonesentiment, method="rf", trControl=tCtrl, tuneLength=10)
+)    # Elapsed 1107.75
+
+#### Galaxy ####
+
+# Train RF model
+set.seed(2395)
+system.time(
+  rfgBalRFEFit <- train(trainSetgBalRFE[,1:18], trainSetgBalRFE$galaxysentiment, method="rf", trControl=tCtrl, tuneLength=10)
+)    # Elapsed 728.26
+
+# Review results
+rfiBalRFEFit
+rfgBalRFEFit
+
+# Oversampling produced better results, but they are still sub-60% on accuracy. 
+
+
+################################################################################
+################################################################################
+###                                                                          ###
+###                             Feature Engineering                          ###
+###                                                                          ###
+################################################################################
+################################################################################
+
+library(dplyr)
+
+#### iPhone ####
+
+# Create a new dataset that will be used for recoding sentiment
+iRC <- iSent
+
+# Recode sentiment to combine factor levels 1 & 2 and 4 & 5
+iRC$iphonesentiment <- recode(iRC$iphonesentiment, '0' = 0, '1' = 1, '2' = 1, '3' = 2, '4' = 3, '5' = 3) 
+
+# Inspect results
+summary(iRC)
+str(iRC)
+
+# Make iphonesentiment a factor
+iRC$iphonesentiment <- as.factor(iRC$iphonesentiment)
+str(iRC$iphonesentiment)
+plot_ly(iRC, x= ~iRC$iphonesentiment, type='histogram')
+
+# Perform RFE on recoded data set
+# Sample the data to improve processing time
+set.seed(2395)
+iRCSample <- iRC[sample(1:nrow(iRC), 1000, replace=FALSE),]
+
+# Use rfe and omit the response variable (attribute 59)
+system.time(
+  iRCrfeResults <- rfe(iRCSample[,1:58], iRCSample$iphonesentiment,
+                     sizes=(1:58), rfeControl=ctrl)
+)    # Elapsed 85.64
+
+# Create new dataset with rfe recommended features
+iRCrfe <- iRC[,predictors(iRCrfeResults)]
+
+# Add the dependent variable to iSentRFE
+iRCrfe$iphonesentiment <- iRC$iphonesentiment
+
+# Splitting iRCrfe into training and testing sets
+set.seed(2395)
+index_iRCrfe <- createDataPartition(iRCrfe$iphonesentiment, p=0.7, list=FALSE)
+trainSetiRCrfe <- iRCrfe[index_iRCrfe,]
+testSetiRCrfe <- iRCrfe[-index_iRCrfe,]
+
+# Train RF model
+set.seed(2395)
+system.time(
+  rfiRCrfeFit <- train(trainSetiRCrfe[,1:25], trainSetiRCrfe$iphonesentiment, method="rf", trControl=tCtrl, tuneLength=10)
+)    # Elapsed 164.00
+
+# Make predictions
+rfiRCrfePreds <- predict(rfiRCrfeFit, newdata=testSetiRCrfe)
+
+# Run postResample on predictions
+rfpriRCrfe <- postResample(rfiRCrfePreds, testSetiRCrfe$iphonesentiment)
+rfpriRCrfe
+
+# Create confusion matrix
+cmRFiRCrfe <- confusionMatrix(rfiRCrfePreds, testSetiRCrfe$iphonesentiment)
+cmRFiRCrfe
+
+
+#### Galaxy ####
+
+# Create a new dataset that will be used for recoding sentiment
+gRC <- gSent
+
+# Recode sentiment to combine factor levels 1 & 2 and 4 & 5
+gRC$galaxysentiment <- recode(gRC$galaxysentiment, '0' = 0, '1' = 1, '2' = 1, '3' = 2, '4' = 3, '5' = 3) 
+
+# Inspect results
+summary(gRC)
+str(gRC)
+
+# Make galaxysentiment a factor
+gRC$galaxysentiment <- as.factor(gRC$galaxysentiment)
+str(gRC$galaxysentiment)
+plot_ly(gRC, x= ~gRC$galaxysentiment, type='histogram')
+
+# Perform RFE on recoded data set
+# Sample the data to improve processing time
+set.seed(2395)
+gRCSample <- gRC[sample(1:nrow(gRC), 1000, replace=FALSE),]
+
+# Use rfe and omit the response variable (attribute 59)
+system.time(
+  gRCrfeResults <- rfe(gRCSample[,1:58], gRCSample$galaxysentiment,
+                       sizes=(1:58), rfeControl=ctrl)
+)    # Elapsed 80.46
+
+# Create new dataset with rfe recommended features
+gRCrfe <- gRC[,predictors(gRCrfeResults)]
+
+# Add the dependent variable to gSentRFE
+gRCrfe$galaxysentiment <- gRC$galaxysentiment
+
+# Splitting gRCrfe into training and testing sets
+set.seed(2395)
+index_gRCrfe <- createDataPartition(gRCrfe$galaxysentiment, p=0.7, list=FALSE)
+trainSetgRCrfe <- gRCrfe[index_gRCrfe,]
+testSetgRCrfe <- gRCrfe[-index_gRCrfe,]
+
+# Train RF model
+set.seed(2395)
+system.time(
+  rfgRCrfeFit <- train(trainSetgRCrfe[,1:26], trainSetgRCrfe$galaxysentiment, method="rf", trControl=tCtrl, tuneLength=10)
+)    # Elapsed 114.95
+
+# Make predictions
+rfgRCrfePreds <- predict(rfgRCrfeFit, newdata=testSetgRCrfe)
+
+# Run postResample on predictions
+rfprgRCrfe <- postResample(rfgRCrfePreds, testSetgRCrfe$galaxysentiment)
+rfprgRCrfe
+
+# Create confusion matrix
+cmRFgRCrfe <- confusionMatrix(rfgRCrfePreds, testSetgRCrfe$galaxysentiment)
+cmRFgRCrfe
+
+
+################################################################################
+################################################################################
+###                                                                          ###
+###                    Feature Engineering with Oversampling                 ###
+###                                                                          ###
+################################################################################
+################################################################################
+
+
+#### iPhone ####
+
+# Create balanced data set for iPhone sentiment
+set.seed(2395)
+iBalRC <- RandOverClassif(iphonesentiment~., iRCrfe, C.perc="balance")
+str(iBalRC)
+plot_ly(iBalRC, x= ~iBalRC$iphonesentiment, type='histogram')
+
+# Splitting iBalRC into training and testing sets
+set.seed(2395)
+index_iBalRC <- createDataPartition(iBalRC$iphonesentiment, p=0.7, list=FALSE)
+trainSetiBalRC <- iBalRC[index_iBalRC,]
+testSetiBalRC <- iBalRC[-index_iBalRC,]
+
+# Train RF model
+set.seed(2395)
+system.time(
+  rfiBalRCFit <- train(trainSetiBalRC[,1:25], trainSetiBalRC$iphonesentiment, method="rf", trControl=tCtrl, tuneLength=10)
+)    # Elapsed 707.79
+
+# Make predictions
+rfiBalRCPreds <- predict(rfiBalRCFit, newdata=testSetiBalRC)
+
+# Run postResample on predictions
+rfpriBalRC <- postResample(rfiBalRCPreds, testSetiBalRC$iphonesentiment)
+rfpriBalRC
+
+# Create confusion matrix
+cmRFiBalRC <- confusionMatrix(rfiBalRCPreds, testSetiBalRC$iphonesentiment)
+
+
+#### Galaxy ####
+
+# Create balanced data set for iPhone sentiment
+set.seed(2395)
+gBalRC <- RandOverClassif(galaxysentiment~., gRCrfe, C.perc="balance")
+str(gBalRC)
+plot_ly(gBalRC, x= ~gBalRC$galaxysentiment, type='histogram')
+
+# Splitting gBalRC into training and testing sets
+set.seed(2395)
+index_gBalRC <- createDataPartition(gBalRC$galaxysentiment, p=0.7, list=FALSE)
+trainSetgBalRC <- gBalRC[index_gBalRC,]
+testSetgBalRC <- gBalRC[-index_gBalRC,]
+
+# Train RF model
+set.seed(2395)
+system.time(
+  rfgBalRCFit <- train(trainSetgBalRC[,1:25], trainSetgBalRC$galaxysentiment, method="rf", trControl=tCtrl, tuneLength=10)
+)    # Elapsed 707.79
+
+# Make predictions
+rfgBalRCPreds <- predict(rfgBalRCFit, newdata=testSetgBalRC)
+
+# Run postResample on predictions
+rfprgBalRC <- postResample(rfgBalRCPreds, testSetgBalRC$galaxysentiment)
+rfprgBalRC
+
+# Create confusion matrix
+cmRFgBalRC <- confusionMatrix(rfgBalRCPreds, testSetgBalRC$galaxysentiment)
+
+# Although the accuracy suffered, taking about a 19-point hit, the true positive
+# rate on the less common classes is much improved.
+
+
+################################################################################
+################################################################################
+###                                                                          ###
+###                             Build Final Models                           ###
+###                                                                          ###
+################################################################################
+################################################################################
+
+
+#### iPhone ####
+
+# Create final tuning grid for model
+iGrid <- expand.grid(mtry=9)
+
+# Create final model
+set.seed(2395)
+iFINAL <- train(trainSetiRCrfe[,1:25], trainSetiRCrfe$iphonesentiment, method="rf", trControl=tCtrl, tuneGrid=iGrid)
+
+# Create final tuning grid for balanced model
+iBalGrid <- expand.grid(mtry=17)
+
+# Create final balanced model
+set.seed(2395)
+iBalFINAL <- train(trainSetiBalRC[,1:25], trainSetiBalRC$iphonesentiment, method="rf", trControl=tCtrl, tuneGrid=iBalGrid)
+
+#### Galaxy ####
+
+# Create final tuning grid for model
+gGrid <- expand.grid(mtry=7)
+
+# Create final model
+set.seed(2395)
+gFINAL <- train(trainSetgRCrfe[,1:26], trainSetgRCrfe$galaxysentiment, method="rf", trControl=tCtrl, tuneGrid=gGrid)
+
+# Create final tuning grid for balanced model
+gBalGrid <- expand.grid(mtry=19)
+
+# Create final balanced model
+set.seed(2395)
+gBalFINAL <- train(trainSetgBalRC[,1:26], trainSetgBalRC$galaxysentiment, method="rf", trControl=tCtrl, tuneGrid=gBalGrid)
+
+################################################################################
+################################################################################
+###                                                                          ###
+###                            Apply Models to Data                          ###
+###                                                                          ###
+################################################################################
+################################################################################
+
+
+# Import large matrices for prediction
+iphoneLM <- read.csv("iphoneLargeMatrix.csv")
+galaxyLM <- read.csv("galaxyLargeMatrix.csv")
+
+# Drop unused features for modeling in both data sets
+iphoneSent <- iphoneLM[,predictors(iRCrfeResults)]
+galaxySent <- galaxyLM[,predictors(gRCrfeResults)]
+
+# Add the dependent variable back to new data sets
+iphoneSent$iphonesentiment <- iphoneLM$iphonesentiment
+galaxySent$galaxysentiment <- galaxyLM$galaxysentiment
+
+# Make dependent a factor
+iphoneSent$iphonesentiment <- as.factor(iphoneSent$iphonesentiment)
+galaxySent$galaxysentiment <- as.factor(galaxySent$galaxysentiment)
+str(iphoneSent)
+str(galaxySent)
+
+# Predict sentiment using final models
+set.seed(2395)
+iphoneFinalPreds <- predict(iFINAL, newdata=iphoneSent)
+set.seed(2395)
+galaxyFinalPreds <- predict(gFINAL, newdata=galaxySent)
+
+# Check sentiment counts for each phone
+summary(iphoneFinalPreds)
+summary(galaxyFinalPreds)
+
+# Add predictions into data frames
+iphoneSent$iphonesentiment <- iphoneFinalPreds
+galaxySent$galaxysentiment <- galaxyFinalPreds
+
+# Predict sentiment using balanced final models
+set.seed(2395)
+iphoneFinalBalPreds <- predict(iBalFINAL, newdata=iphoneSent)
+set.seed(2395)
+galaxyFinalBalPreds <- predict(gBalFINAL, newdata=galaxySent)
+
+# Check sentiment counts for each phone
+summary(iphoneFinalBalPreds)
+summary(galaxyFinalBalPreds)
+
+# Add predictions into data frames
+iphoneSent$iphonesentimentbalanced <- iphoneFinalPreds
+galaxySent$galaxysentimentbalanced <- galaxyFinalPreds
+
+plot_ly(iphoneSent, x= ~iphoneSent$iphonesentiment, type='histogram')
+plot_ly(galaxySent, x= ~galaxySent$galaxysentiment, type='histogram')
+
+plot_ly(iphoneSent, x= ~iphoneSent$iphonesentimentbalanced, type='histogram')
+plot_ly(galaxySent, x= ~galaxySent$galaxysentimentbalanced, type='histogram')
+
+
+################################################################################
+################################################################################
+###                                                                          ###
+###                                Plot Results                              ###
+###                                                                          ###
+################################################################################
+################################################################################
+
+# FINAL
+# Create data frame for plotting iPhone sentiment
+ipieData <- data.frame(iPie = c("sentiment unclear", "negative", "neutral", "positive"), 
+                      ivalues = c(16323, 798, 574, 4661))
+
+# Create pie chart 
+plot_ly(ipieData, labels = ~iPie, values = ~ivalues, type = "pie",
+              textposition = 'inside',
+              textinfo = 'label+percent',
+              insidetextfont = list(color = '#FFFFFF'),
+              hoverinfo = 'text',
+              text = ~paste(ivalues),
+              marker = list(colors = colors,
+                            line = list(color = '#FFFFFF', width = 1)),
+              showlegend = F) %>%
+  layout(title = 'iPhone Sentiment', 
+         xaxis = list(showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE),
+         yaxis = list(showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE))
+
+
+# Create data frame for plotting iPhone sentiment w/o "unclear"
+ipieData <- data.frame(iPie = c("negative", "neutral", "positive"), 
+                       ivalues = c(798, 574, 4661))
+
+# Create pie chart 
+plot_ly(ipieData, labels = ~iPie, values = ~ivalues, type = "pie",
+        textposition = 'inside',
+        textinfo = 'label+percent',
+        insidetextfont = list(color = '#FFFFFF'),
+        hoverinfo = 'text',
+        text = ~paste(ivalues),
+        marker = list(colors = colors,
+                      line = list(color = '#FFFFFF', width = 1)),
+        showlegend = F) %>%
+  layout(title = 'iPhone Sentiment', 
+         xaxis = list(showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE),
+         yaxis = list(showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE))
+
+
+# Create data frame for plotting Galaxy sentiment
+gpieData <- data.frame(gPie = c("sentiment unclear", "negative", "neutral", "positive"), 
+                       gvalues = c(16377, 798, 530, 4651))
+
+# Create pie chart 
+plot_ly(gpieData, labels = ~gPie, values = ~gvalues, type = "pie",
+        textposition = 'inside',
+        textinfo = 'label+percent',
+        insidetextfont = list(color = '#FFFFFF'),
+        hoverinfo = 'text',
+        text = ~paste(gvalues),
+        marker = list(colors = colors,
+                      line = list(color = '#FFFFFF', width = 1)),
+        showlegend = F) %>%
+  layout(title = 'Galaxy Sentiment', 
+         xaxis = list(showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE),
+         yaxis = list(showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE))
+
+
+# Create data frame for plotting Galaxy sentiment w/o "unclear"
+gpieData <- data.frame(gPie = c("negative", "neutral", "positive"), 
+                       gvalues = c(798, 530, 4651))
+
+# Create pie chart 
+plot_ly(gpieData, labels = ~gPie, values = ~gvalues, type = "pie",
+        textposition = 'inside',
+        textinfo = 'label+percent',
+        insidetextfont = list(color = '#FFFFFF'),
+        hoverinfo = 'text',
+        text = ~paste(gvalues),
+        marker = list(colors = colors,
+                      line = list(color = '#FFFFFF', width = 1)),
+        showlegend = F) %>%
+  layout(title = 'Galaxy Sentiment', 
+         xaxis = list(showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE),
+         yaxis = list(showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE))
+
+
+# BalFINAL
+# Create data frame for plotting balanced iPhone sentiment
+ipieBalData <- data.frame(iPieBal = c("sentiment unclear", "negative", "neutral", "positive"), 
+                       iBalvalues = c(16385, 1201, 587, 4183))
+
+# Create pie chart 
+plot_ly(ipieBalData, labels = ~iPieBal, values = ~iBalvalues, type = "pie",
+        textposition = 'inside',
+        textinfo = 'label+percent',
+        insidetextfont = list(color = '#FFFFFF'),
+        hoverinfo = 'text',
+        text = ~paste(iBalvalues),
+        marker = list(colors = colors,
+                      line = list(color = '#FFFFFF', width = 1)),
+        showlegend = F) %>%
+  layout(title = 'iPhone Sentiment', 
+         xaxis = list(showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE),
+         yaxis = list(showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE))
+
+
+# Create data frame for plotting balanced iPhone sentiment w/o "unclear"
+ipieBalData <- data.frame(iBalPie = c("negative", "neutral", "positive"), 
+                       iBalvalues = c(1201, 587, 4183))
+
+# Create pie chart 
+plot_ly(ipieBalData, labels = ~iBalPie, values = ~iBalvalues, type = "pie",
+        textposition = 'inside',
+        textinfo = 'label+percent',
+        insidetextfont = list(color = '#FFFFFF'),
+        hoverinfo = 'text',
+        text = ~paste(iBalvalues),
+        marker = list(colors = colors,
+                      line = list(color = '#FFFFFF', width = 1)),
+        showlegend = F) %>%
+  layout(title = 'iPhone Sentiment', 
+         xaxis = list(showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE),
+         yaxis = list(showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE))
+
+
+# Create data frame for plotting balanced Galaxy sentiment
+gpieBalData <- data.frame(gBalPie = c("sentiment unclear", "negative", "neutral", "positive"), 
+                       gBalvalues = c(16358, 1524, 642, 3832))
+
+# Create pie chart 
+plot_ly(gpieBalData, labels = ~gBalPie, values = ~gBalvalues, type = "pie",
+        textposition = 'inside',
+        textinfo = 'label+percent',
+        insidetextfont = list(color = '#FFFFFF'),
+        hoverinfo = 'text',
+        text = ~paste(gBalvalues),
+        marker = list(colors = colors,
+                      line = list(color = '#FFFFFF', width = 1)),
+        showlegend = F) %>%
+  layout(title = 'Galaxy Sentiment', 
+         xaxis = list(showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE),
+         yaxis = list(showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE))
+
+
+# Create data frame for plotting balanced Galaxy sentiment w/o "unclear"
+gpieBalData <- data.frame(gBalPie = c("negative", "neutral", "positive"), 
+                       gBalvalues = c(1524, 642, 3832))
+
+# Create pie chart 
+plot_ly(gpieBalData, labels = ~gBalPie, values = ~gBalvalues, type = "pie",
+        textposition = 'inside',
+        textinfo = 'label+percent',
+        insidetextfont = list(color = '#FFFFFF'),
+        hoverinfo = 'text',
+        text = ~paste(gBalvalues),
+        marker = list(colors = colors,
+                      line = list(color = '#FFFFFF', width = 1)),
+        showlegend = F) %>%
+  layout(title = 'Galaxy Sentiment', 
+         xaxis = list(showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE),
+         yaxis = list(showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE))
